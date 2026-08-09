@@ -1,0 +1,18 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "jpeg_quality": 82,
+  "reconnect_delay_seconds": 2,
+  "auto_start": true,
+  "cameras": [
+    {
+      "name": "Front Gate",
+      "url": "rtsp://username:password@192.168.1.10:554/stream1"
+    },
+    {
+      "name": "Warehouse",
+      "url": "rtsp://username:password@192.168.1.11:554/stream1",
+      "auto_start": false
+    }
+  ]
+}
