@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>RTSP Replayer</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LIVE MONITOR</p>
+          <h1>RTSP Replayer</h1>
+        </div>
+        <div id="overall-status" class="status-pill waiting">
+          <span class="status-dot"></span>
+          <span>Loading</span>
+        </div>
+      </header>
+
+      <section class="viewer" aria-label="Camera viewer">
+        <img id="stream" alt="Selected camera live stream">
+        <div id="empty-state" class="empty-state">
+          <div class="camera-mark" aria-hidden="true"></div>
+          <strong id="empty-title">Connecting to server</strong>
+          <span id="empty-detail">Camera status will appear here.</span>
+        </div>
+        <div class="viewer-label">
+          <span id="camera-name">No camera selected</span>
+          <span id="fps"></span>
+        </div>
+      </section>
+
+      <section class="controls" aria-label="Stream controls">
+        <label class="field">
+          <span>Camera</span>
+          <select id="camera-select" disabled>
+            <option>Loading cameras…</option>
+          </select>
+        </label>
+        <div class="button-row">
+          <button id="start" class="primary" type="button" disabled>
+            <span class="play-icon" aria-hidden="true"></span>Start
+          </button>
+          <button id="stop" type="button" disabled>
+            <span class="stop-icon" aria-hidden="true"></span>Stop
+          </button>
+        </div>
+      </section>
+
+      <section class="camera-editor" aria-labelledby="editor-title">
+        <div class="editor-heading">
+          <div>
+            <p class="section-label">CAMERA SETTINGS</p>
+            <h2 id="editor-title">Selected camera</h2>
+          </div>
+          <button id="add-camera" type="button">+ Add camera</button>
+        </div>
+
+        <form id="camera-form">
+          <div class="editor-grid">
+            <label class="field">
+              <span>Name</span>
+              <input id="camera-input-name" name="name" type="text" maxlength="100" required>
+            </label>
+            <label class="field url-field">
+              <span>RTSP URL</span>
+              <input id="camera-input-url" name="url" type="text" inputmode="url"
+                autocomplete="off" spellcheck="false" placeholder="rtsp://user:password@host/stream" required>
+            </label>
+          </div>
+          <div class="editor-actions">
+            <label class="check-field">
+              <input id="camera-input-auto-start" name="auto_start" type="checkbox">
+              <span>Start this camera automatically when the server starts</span>
+            </label>
+            <div class="editor-buttons">
+              <span id="form-message" class="form-message" role="status"></span>
+              <button id="cancel-camera" class="hidden" type="button">Cancel</button>
+              <button id="save-camera" class="primary" type="submit">Save changes</button>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <footer>
+        <span id="detail">Waiting for server…</span>
+        <span id="last-frame"></span>
+      </footer>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

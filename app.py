@@ -109,9 +109,13 @@ def load_settings(path: str | Path) -> AppSettings:
     camera_rows = raw.get("cameras")
     if camera_rows is None:
         legacy_url = raw.get("rtsp_url", raw.get("url"))
-        camera_rows = [{"name": raw.get("name", "Camera 1"), "url": legacy_url}]
-    if not isinstance(camera_rows, list) or not camera_rows:
-        raise SettingsError("'cameras' must be a non-empty array")
+        camera_rows = (
+            []
+            if legacy_url is None
+            else [{"name": raw.get("name", "Camera 1"), "url": legacy_url}]
+        )
+    if not isinstance(camera_rows, list):
+        raise SettingsError("'cameras' must be an array")
 
     default_auto_start = raw.get("auto_start", True)
     if not isinstance(default_auto_start, bool):
@@ -352,6 +356,8 @@ class CameraStream:
             return {
                 "id": self.config.id,
                 "name": self.config.name,
+                "url": self.config.url,
+                "auto_start": self.config.auto_start,
                 "state": self._state,
                 "detail": self._detail,
                 "running": bool(thread and thread.is_alive() and not self._stop_event.is_set()),
@@ -362,21 +368,130 @@ class CameraStream:
 
 
 class StreamManager:
-    def __init__(self, settings: AppSettings, cv2_loader: Callable[[], Any] | None = None) -> None:
+    def __init__(
+        self,
+        settings: AppSettings,
+        cv2_loader: Callable[[], Any] | None = None,
+        settings_path: str | Path | None = None,
+    ) -> None:
+        self.settings = settings
+        self.settings_path = Path(settings_path) if settings_path is not None else None
+        self._cv2_loader = cv2_loader
+        self._lock = threading.RLock()
         self.cameras = {
             config.id: CameraStream(config, settings, cv2_loader) for config in settings.cameras
         }
 
     def start_configured(self) -> None:
-        for camera in self.cameras.values():
+        with self._lock:
+            cameras = list(self.cameras.values())
+        for camera in cameras:
             if camera.config.auto_start:
                 camera.start()
 
     def statuses(self) -> list[dict[str, Any]]:
-        return [camera.status() for camera in self.cameras.values()]
+        with self._lock:
+            cameras = list(self.cameras.values())
+        return [camera.status() for camera in cameras]
+
+    def get(self, camera_id: str) -> CameraStream | None:
+        with self._lock:
+            return self.cameras.get(camera_id)
+
+    @staticmethod
+    def _config_from_payload(
+        payload: dict[str, Any], camera_id: str, default_auto_start: bool
+    ) -> CameraConfig:
+        name = payload.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SettingsError("Camera needs a non-empty 'name'")
+        name = name.strip()
+        url = _validate_url(payload.get("url"), name)
+        auto_start = payload.get("auto_start", payload.get("autoStart", default_auto_start))
+        if not isinstance(auto_start, bool):
+            raise SettingsError(f"Camera '{name}' has a non-boolean 'auto_start'")
+        return CameraConfig(camera_id, name, url, auto_start)
+
+    def _persist(self, configs: list[CameraConfig]) -> None:
+        if self.settings_path is None:
+            return
+
+        path = self.settings_path
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not isinstance(raw, dict):
+                raise SettingsError("The settings file must contain a JSON object")
+        except json.JSONDecodeError as exc:
+            raise SettingsError(
+                f"Invalid JSON in {path}: {exc.msg} (line {exc.lineno})"
+            ) from exc
+        except FileNotFoundError:
+            raw = {}
+
+        raw["cameras"] = [
+            {
+                "id": config.id,
+                "name": config.name,
+                "url": config.url,
+                "auto_start": config.auto_start,
+            }
+            for config in configs
+        ]
+        # A successful UI edit upgrades the legacy single-camera shape to the
+        # canonical cameras array so the old fields cannot override it later.
+        for legacy_key in ("rtsp_url", "url", "name"):
+            raw.pop(legacy_key, None)
+
+        temporary = path.with_name(f".{path.name}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            temporary.replace(path)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def add(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            base_id = _slug(str(payload.get("name", "")), f"camera-{len(self.cameras) + 1}")
+            camera_id = base_id
+            suffix = 2
+            while camera_id in self.cameras:
+                camera_id = f"{base_id}-{suffix}"
+                suffix += 1
+            config = self._config_from_payload(payload, camera_id, True)
+            configs = [camera.config for camera in self.cameras.values()] + [config]
+            self._persist(configs)
+            camera = CameraStream(config, self.settings, self._cv2_loader)
+            self.cameras[camera_id] = camera
+        if config.auto_start:
+            camera.start()
+        return camera.status()
+
+    def update(self, camera_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        with self._lock:
+            previous = self.cameras.get(camera_id)
+            if previous is None:
+                return None
+            config = self._config_from_payload(payload, camera_id, previous.config.auto_start)
+            was_running = previous.status()["running"]
+            configs = [
+                config if item.config.id == camera_id else item.config
+                for item in self.cameras.values()
+            ]
+            self._persist(configs)
+            camera = CameraStream(config, self.settings, self._cv2_loader)
+            self.cameras[camera_id] = camera
+        previous.stop()
+        if was_running:
+            camera.start()
+        return camera.status()
 
     def close(self) -> None:
-        for camera in self.cameras.values():
+        with self._lock:
+            cameras = list(self.cameras.values())
+        for camera in cameras:
             camera.stop()
 
 
@@ -413,6 +528,25 @@ class ReplayRequestHandler(BaseHTTPRequestHandler):
         self._send_headers(HTTPStatus.OK, content_type, len(body))
         self.wfile.write(body)
 
+    def _read_json_object(self) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid Content-Length"})
+            return None
+        if length <= 0 or length > 64 * 1024:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "A JSON request body is required"})
+            return None
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Request body must be valid JSON"})
+            return None
+        if not isinstance(payload, dict):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Request body must be a JSON object"})
+            return None
+        return payload
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = unquote(urlsplit(self.path).path)
         if path == "/":
@@ -436,11 +570,27 @@ class ReplayRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = unquote(urlsplit(self.path).path)
+        if path == "/api/cameras":
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            try:
+                status = self.manager.add(payload)
+            except SettingsError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except OSError as exc:
+                LOGGER.error("Could not save camera settings: %s", exc)
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Could not save settings"})
+                return
+            self._json(HTTPStatus.CREATED, status)
+            return
+
         match = re.fullmatch(r"/api/cameras/([a-z0-9-]+)/(start|stop)", path)
         if not match:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
-        camera = self.manager.cameras.get(match.group(1))
+        camera = self.manager.get(match.group(1))
         if camera is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Unknown camera"})
             return
@@ -450,8 +600,31 @@ class ReplayRequestHandler(BaseHTTPRequestHandler):
             camera.stop()
         self._json(HTTPStatus.OK, camera.status())
 
+    def do_PUT(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        path = unquote(urlsplit(self.path).path)
+        match = re.fullmatch(r"/api/cameras/([a-z0-9-]+)", path)
+        if not match:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            return
+        payload = self._read_json_object()
+        if payload is None:
+            return
+        try:
+            status = self.manager.update(match.group(1), payload)
+        except SettingsError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        except OSError as exc:
+            LOGGER.error("Could not save camera settings: %s", exc)
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Could not save settings"})
+            return
+        if status is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Unknown camera"})
+            return
+        self._json(HTTPStatus.OK, status)
+
     def _stream(self, camera_id: str) -> None:
-        camera = self.manager.cameras.get(camera_id)
+        camera = self.manager.get(camera_id)
         if camera is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Unknown camera"})
             return
@@ -482,8 +655,13 @@ class ReplayRequestHandler(BaseHTTPRequestHandler):
             camera.remove_client()
 
 
-def create_server(settings: AppSettings, host: str | None = None, port: int | None = None) -> tuple[ThreadingHTTPServer, StreamManager]:
-    manager = StreamManager(settings)
+def create_server(
+    settings: AppSettings,
+    host: str | None = None,
+    port: int | None = None,
+    settings_path: str | Path | None = None,
+) -> tuple[ThreadingHTTPServer, StreamManager]:
+    manager = StreamManager(settings, settings_path=settings_path)
 
     class BoundHandler(ReplayRequestHandler):
         pass
@@ -513,7 +691,9 @@ def main(argv: list[str] | None = None) -> int:
         settings = load_settings(args.settings)
         if args.port is not None and not 1 <= args.port <= 65535:
             raise SettingsError("--port must be between 1 and 65535")
-        server, manager = create_server(settings, args.host, args.port)
+        server, manager = create_server(
+            settings, args.host, args.port, settings_path=args.settings
+        )
     except (SettingsError, OSError) as exc:
         LOGGER.error("%s", exc)
         return 2
